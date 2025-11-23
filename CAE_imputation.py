@@ -506,9 +506,13 @@ class SNP_Autoencoder:
         return results
 
 
-    def eval(self, data_missing, data_full, data_maf=None, snp_means=None, visualize=False, model_path=None):
+    def eval(self, data_missing, data_full, data_maf=None, snp_means=None, visualize=False, model_path=None, save_parent_dir=None):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        save_dir = Path("results") / f"eval_{timestamp}"
+        # If a parent directory is provided, create the eval folder inside it.
+        if save_parent_dir is not None:
+            save_dir = Path(save_parent_dir) / f"eval_{timestamp}"
+        else:
+            save_dir = Path("results") / f"eval_{timestamp}"
         save_dir.mkdir(parents=True, exist_ok=True)
 
         if model_path is not None:
@@ -656,6 +660,7 @@ def train(
 
     typer.secho(f"[INFO] Run artifacts saved to: {run_dir}", fg=typer.colors.BRIGHT_GREEN)
     typer.secho(f"[SUCCESS] Training finished. Saved best model and artifacts in: {run_dir}", fg=typer.colors.BRIGHT_CYAN, bold=True)
+    return str(run_dir)
 
 @app.command() 
 def eval(
@@ -664,7 +669,8 @@ def eval(
     maf_path: str = typer.Option(None, help="[Optional] MAF scores for evaluation."),
     model_path: str = typer.Option("autoencoder_best.keras", help="Path to trained model (.keras)"),
     means_path: str = typer.Option(None, help="Path to SNP means (.npy). If not provided, must run training within same process."),
-    visualize: bool = typer.Option(False, help="Show confusion matrix and loss plot")
+    visualize: bool = typer.Option(False, help="Show confusion matrix and loss plot"),
+    eval_parent_dir: str = typer.Option(None, help="Optional parent directory to place eval outputs (e.g., training run dir). If provided, eval results will be written to <parent>/eval_<timestamp>.")
 ):
     dataMISS = read_csv_array(test_path)
     dataFULL = read_csv_array(full_path)
@@ -690,7 +696,7 @@ def eval(
         
     typer.secho("[INFO] Predicting on test dataset...", fg=typer.colors.BRIGHT_GREEN)
     snp_ae = SNP_Autoencoder(num_snps=num_snps)
-    snp_ae.eval(data_missing=dataMISS, data_full=dataFULL, data_maf=dataMAF, snp_means=snp_means, visualize=visualize, model_path=model_path)
+    snp_ae.eval(data_missing=dataMISS, data_full=dataFULL, data_maf=dataMAF, snp_means=snp_means, visualize=visualize, model_path=model_path, save_parent_dir=eval_parent_dir)
     typer.secho("[SUCCESS] Evaluation complete.", fg=typer.colors.BRIGHT_CYAN, bold=True)
 
 @app.command("train-and-eval")
@@ -715,8 +721,7 @@ def train_and_eval(
     Train the SNP autoencoder and immediately evaluate it on a test dataset.
     Combines `train` and `eval` into one command.
     """
-
-    train(
+    run_dir = train(
         train_path=train_path,
         miss_path=test_path,
         save_model=save_model,
@@ -731,13 +736,17 @@ def train_and_eval(
         embed_dim=embed_dim
     )
 
+    model_path_in_run = Path(run_dir) / Path(save_model).name
+    means_path_in_run = Path(run_dir) / "snp_means.npy"
+
     eval(
         test_path=test_path,
         full_path=test_full_path,
         maf_path=maf_path,
-        model_path=save_model,
-        means_path="snp_means.npy",
-        visualize=visualize
+        model_path=str(model_path_in_run),
+        means_path=str(means_path_in_run),
+        visualize=visualize,
+        eval_parent_dir=str(run_dir),
     )
 
 if __name__ == "__main__":
