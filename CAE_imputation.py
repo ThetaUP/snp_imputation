@@ -1,225 +1,73 @@
 """
 CAE_imputation.py
-
-Training / evaluating a SNP convolutional autoencoder for genotype imputation.
-- train mode computes and saves SNP column means (per-SNP means) and the best model
-- eval mode can take provided means or use means saved during training
-
 """
+
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-import typer
-import tensorflow as tf
-from keras.layers       import Input, Dense, Softmax, Reshape, Flatten, Conv1D, SpatialDropout1D, BatchNormalization, Conv1DTranspose
-from keras.callbacks    import EarlyStopping, ModelCheckpoint
-from keras.models       import Model, load_model
-from keras.optimizers   import AdamW
-from keras.regularizers import l2
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import warnings
 from pathlib import Path
 from datetime import datetime
-from tqdm.keras import TqdmCallback
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay, f1_score
-print("TensorFlow version:", tf.__version__)
-print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
-print("Devices:", tf.config.list_physical_devices())
-# If GPUs are available, enable memory growth to avoid TF allocating all memory.
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        typer.secho(f"[INFO] Enabled memory growth for {len(gpus)} GPU(s)", fg=typer.colors.BRIGHT_GREEN)
-    except Exception as e:
-        typer.secho(f"[WARNING] Could not set GPU memory growth: {e}", fg=typer.colors.YELLOW)
-else:
-    typer.secho("[INFO] No GPU detected; using CPU.", fg=typer.colors.BRIGHT_YELLOW)
-#tf.debugging.set_log_device_placement(True)
 
+# os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import typer
+import numpy as np
+import csv
+import tensorflow as tf
+from keras.layers import (
+    Input, Dense, Softmax, Reshape, Flatten,
+    Conv1D, SpatialDropout1D, BatchNormalization, Conv1DTranspose
+)
+from keras.models import Model, load_model
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.optimizers import AdamW
+from keras.regularizers import l2
+from tqdm.keras import TqdmCallback
+from sklearn.metrics import classification_report, accuracy_score, f1_score
+from utils import (
+    read_csv_array, read_maf, prepare_balanced_mask, MaskedCELoss,
+    MultiClassFocalLoss, create_train_val_datasets, maf_stratified_metrics,
+    F1MacroCallback
+)
+
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ==========================
+# TensorFlow & GPU setup
+# ==========================
+print("TensorFlow version:", tf.__version__)
+# print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+# print("Devices:", tf.config.list_physical_devices())
+
+# ==========================
+# Typer setup
+# ==========================
 app = typer.Typer(
     add_completion=True,
     rich_markup_mode="rich",
     help=""" Convolutional Autoencoder for SNP Imputation
 
-Examples:
------------
+ python CAE_imputation.py --help
 
-Train the model:
-  python CAE_imputation.py train \\
-    --train-path ../data/genotypes.csv \\
-    --test-path ../data/genotypesTest.csv \\
-    --full-path ../data/genotypesTestFull.csv \\
-    --epochs 1000 \\
-    --batch-size 128 \\
-    --lr 1e-4 \\
-    --model-path autoencoder_best.keras \\
-    --means-path snp_means.npy
+ python CAE_imputation.py train --help
 
-Validate:
-  python CAE_imputation.py val \\
-    --test-path ../data/genotypesTest.csv \\
-    --full-path ../data/genotypesTestFull.csv \\
-    --model-path autoencoder_best.keras \\
-    --means-path snp_means.npy \\
-    --visualize
+ python CAE_imputation.py eval --help
 
-Minimal:
-  python CAE_imputation.py train --train-path data/genotypes.csv --miss-path data/genotypesTest.csv
-  python CAE_imputation.py val --test-path data/genotypesTest.csv --full-path data/genotypesTestFull.csv --means-path snp_means.npy
-
-Combined example:
-  python CAE_imputation.py train-and-eval --train-path ../data/genotypes.csv --test-path ../data/genotypesTest.csv --test-full-path ../data/genotypesTestFull.csv
-
+ python CAE_imputation.py train-and-eval --help
+ 
 """
 )
 
-def read_csv_array(path):
-    p = Path(path)
-    if not p.exists():
-        typer.echo(f"File not found: {path}.")
-        return None
-    return pd.read_csv(path, header=None).values.astype(np.float32)
-
-def read_maf(maf_path):
-    """
-    Reads a MAF CSV file (no header), drops the last column,
-    and returns it as a NumPy float64 array.
-    """
-    p = Path(maf_path)
-    if not p.exists():
-        print(f"[ERROR] File not found: {maf_path}")
-        return None
-
-    try:
-        dataMAF = pd.read_csv(p, header=None)
-        dataMAF = dataMAF.drop(dataMAF.columns[-1], axis=1)
-        dataMAF = dataMAF.values.astype(np.float64)
-        print(f"[INFO] Loaded MAF file '{maf_path}' with shape {dataMAF.shape}")
-        return dataMAF
-    except Exception as e:
-        print(f"[ERROR] Failed to read MAF file: {e}")
-        return None
-
-def prepare_balanced_mask(dataTRAIN, dataMISS=None, mult_1=2.3, mult_2=2.6, seed=222):
-    """
-    "Mask engineering" - add extra masked positions to balance the genotype
-    distribution among masked entries for better representation of rare classes.
-
-    Args:
-        dataTRAIN (np.ndarray): Training genotypes (complete, true values).
-        dataMISS (np.ndarray): Masked genotypes (3 == missing). If not provided, random 20% of columns are masked as initial mask.
-        mult_1 (float): Multiplier to genotype 1 class in masked positions.
-        mult_2 (float): Multiplier to genotype 2 class in masked positions.
-        seed (int): Random seed.
-
-    Returns:
-        mask_final (tf.Tensor): Boolean-like mask (float32) same shape as dataMISS.
-        w0, w1, w2 (float): Inverse-frequency weights of genotypes within masked positions.
-    """
-    rng = np.random.default_rng(seed)
-    # no test data provided -> create fake missing positions - 20% of columns
-    if dataMISS is None:
-        dataMISS = dataTRAIN.copy()
-        n_cols_to_modify = int(0.2 * dataMISS.shape[1])
-        cols_to_modify = rng.choice(dataMISS.shape[1], size=n_cols_to_modify, replace=False)
-        dataMISS[:, cols_to_modify] = 3
-        typer.secho(f"[INFO] Mask not provided, created synthetic mask in {n_cols_to_modify} columns.", fg=typer.colors.CYAN)
-
-    # if test data provided but shape is not the same -> error
-    if dataTRAIN.shape[1] != dataMISS.shape[1]:
-        raise ValueError("dataTRAIN and dataMISS must have the same number of columns (SNPs).")
-    
-
-    # check which columns are missing in test data
-    col_missing = np.all(dataMISS == 3, axis=0)
-    # prepare minimal mask in train data with those missing positions
-    mask_temp = np.zeros_like(dataTRAIN, dtype=bool)
-    mask_temp[:, col_missing] = True
-
-    # flatten
-    mask_flat = mask_temp.flatten()
-    orig_flat = dataTRAIN.flatten()
-
-    # stats 
-    num_masked = np.sum(mask_flat)
-    total = orig_flat.size
-    typer.secho(f"Total masked positions (before mask balancing): {num_masked} / {total} ({num_masked / total * 100:.2f}%)", fg=typer.colors.BRIGHT_MAGENTA)
-
-    masked_vals = orig_flat[mask_flat]
-    unique, counts = np.unique(masked_vals, return_counts=True)
-    typer.secho("Genotype distribution:", fg=typer.colors.BRIGHT_MAGENTA)
-    for u, c in zip(unique, counts):
-        typer.secho(f"Genotype {int(u)}: {c} ({c / counts.sum() * 100:.2f}%)")
-
-    # balancing
-    c0, c1, c2 = [np.sum(masked_vals == x) for x in [0, 1, 2]]
-    t1 = min(c0, int(mult_1 * c1))
-    t2 = min(c0, int(mult_2 * c2))
-    e1, e2 = max(0, t1 - c1), max(0, t2 - c2)
-
-    new_mask = mask_flat.copy()
-    for val, extra in [(1, e1), (2, e2)]:
-        if extra > 0:
-            candidates = np.where((orig_flat == val) & (~new_mask))[0]
-            if len(candidates) > 0:
-                chosen = rng.choice(candidates, size=min(extra, len(candidates)), replace=False)
-                new_mask[chosen] = True
-
-    # after balancing
-    typer.secho("***************************", fg=typer.colors.BRIGHT_MAGENTA)
-    num_masked_new = np.sum(new_mask)
-    typer.secho(f"Total masked positions (after mask balancing): {num_masked_new} / {total} ({num_masked_new / total * 100:.2f}%)", fg=typer.colors.BRIGHT_MAGENTA)
-
-
-    masked_vals_new = orig_flat[new_mask]
-    unique, counts = np.unique(masked_vals_new, return_counts=True)
-    total = counts.sum()
-    typer.secho("Genotype distribution:", fg=typer.colors.BRIGHT_MAGENTA)
-    for u, c in zip(unique, counts):
-        typer.secho(f"Genotype {int(u)}: {c} ({c / counts.sum() * 100:.2f}%)")
-
-    inv_freqs = total / counts
-    inv_freqs = inv_freqs / np.mean(inv_freqs)  # normalize so average weight ≈ 1
-    typer.secho("Inverse count frequency weights:", fg=typer.colors.BRIGHT_MAGENTA)
-    for u, w in zip(unique, inv_freqs):
-        typer.secho(f"Genotype {int(u)}: weight = {w:.3f}")
-
-    new_mask = new_mask.reshape(dataTRAIN.shape)
-    #new_mask = tf.cast(new_mask, dtype=tf.float32)
-    new_mask = new_mask.astype(np.float32)
-
-    return new_mask, inv_freqs[0], inv_freqs[1], inv_freqs[2]
-
-# ------------------------
-# Dataset class
-# ------------------------
-class MaskedDataset(tf.keras.utils.Sequence):
-    def __init__(self, x, mask, batch_size):
-        super().__init__() 
-        self.x = np.array(x, dtype=np.float32)
-        self.mask = np.array(mask, dtype=np.float32)
-        self.batch_size = batch_size
-
-    def __len__(self):
-        return int(np.ceil(len(self.x) / self.batch_size))
-
-    def __getitem__(self, idx):
-        batch_idx = np.arange(idx * self.batch_size, (idx + 1) * self.batch_size)
-        batch_idx = batch_idx[batch_idx < len(self.x)]
-        x_batch = self.x[batch_idx]
-        mask_batch = self.mask[batch_idx]
-        # pack y_true and mask into one tensor
-        y_combined = np.stack([x_batch, mask_batch], axis=-1)  # shape [batch, num_snps, 2]
-        return x_batch, y_combined
-    
 # ------------------------
 # Autoencoder class
 # ------------------------
 class SNP_Autoencoder:
-    def __init__(self, num_snps, mask_miss=None, weight=0.0, weight_0=1.0, weight_1=1.0, weight_2=1.0, lr=1e-4, MAF_threshold=0.05, window_size=15, embed_dim=16):
+    def __init__(self, num_snps, mask_miss=None, weight=0.0, weight_0=1.0, weight_1=1.0, weight_2=1.0,
+                 lr=1e-4, MAF_threshold=0.05, window_size=30, embed_dim=16,
+                 activation='relu', padding='valid', strides=3, gamma=2.0, dropout_rate=0.2,
+                 l2_factor=1e-4, loss="ce", export_model_name="CAE", mult_1=2.3, mult_2=2.6):
         self.num_snps = num_snps
         self.mask_miss = mask_miss
 
@@ -227,356 +75,256 @@ class SNP_Autoencoder:
         self.weight_0 = float(weight_0)
         self.weight_1 = float(weight_1)
         self.weight_2 = float(weight_2)
+        self.gamma = float(gamma)
+
+        self.mult_1 = mult_1
+        self.mult_2 = mult_2
+
+        self.export_model_name = export_model_name
 
         self.window_size = window_size
         self.embed_dim = embed_dim
+        self.activation = activation
+        self.padding = padding
+        self.strides = strides
+        self.l2_factor = l2_factor
+        self.dropout_rate = float(dropout_rate)
+        self.lr = lr
+
+        self.loss = loss  # CrossEntropy (categorical)
 
         self.model = self.build_model()
+        print(f"[MODEL INFO] {type(self.model).__name__} | params = {self.model.count_params():,}")
+        self.compile()
         self.loss_history = None
         self.snp_means = None
         self.MAF_threshold = MAF_threshold
 
-
-    def masked_ce(self, y_true_with_mask, y_pred):
-        """
-        y_true: integer labels in shape (batch, num_snps)
-        y_pred: probabilities shape (batch, num_snps, 3)
-        Compute sparse categorical crossentropy per SNP and apply weights:
-          - mask_weighted: up/down weight missing positions per sample
-          - genotype weights: weight_0/1/2
-        """
-        y_true = y_true_with_mask[..., 0]
-        mask_batch = y_true_with_mask[..., 1]
-        y_true = tf.cast(y_true, tf.int32)  # [batch, num_snps]
-        mask_weighted = mask_batch * (1. - self.weight) + self.weight
-
-        # weights for genotypes 0, 1, 2
-        mask_weighted_genotypes = (
-            self.weight_0 * tf.cast(y_true == 0, tf.float32) +
-            self.weight_1 * tf.cast(y_true == 1, tf.float32) +
-            self.weight_2 * tf.cast(y_true == 2, tf.float32)
-        )
-
-        # categorical crossentropy per SNP
-        ce = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)  # [batch, num_snps]
-
-        # apply both weights
-        weighted_ce = mask_weighted * mask_weighted_genotypes * ce
-
-        # average over all SNPs in batch
-        loss = tf.reduce_mean(weighted_ce)
-        return loss
-    
-    def multi_class_focal_loss(self, y_true_with_mask, y_pred, gamma=2.0):
-        """
-        Multi-class focal loss with per-class weights and masking.
-        """
-        y_true = y_true_with_mask[..., 0]
-        mask_batch = y_true_with_mask[..., 1]
-
-        # Convert y_true to int and one-hot encode
-        y_true = tf.cast(y_true, tf.int32)
-        y_true_oh = tf.one_hot(y_true, depth=3)
-
-        # Clip predictions to avoid log(0)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0)
-
-        # Compute per-class alpha weights
-        alpha = tf.constant([self.weight_0, self.weight_1, self.weight_2], dtype=tf.float32)
-        alpha_t = tf.reduce_sum(alpha * y_true_oh, axis=-1)
-
-        # Compute p_t (prob of true class)
-        p_t = tf.reduce_sum(y_true_oh * y_pred, axis=-1)
-
-        # Focal term
-        focal_term = tf.pow(1.0 - p_t, gamma)
-
-        # CE term
-        ce = -tf.reduce_sum(y_true_oh * tf.math.log(y_pred), axis=-1)
-
-        # Combine: α * (1 - p_t)^γ * CE
-        loss = alpha_t * focal_term * ce
-
-        # Apply your SNP mask weighting
-        mask_weighted = mask_batch * (1. - self.weight) + self.weight
-        loss = mask_weighted * loss
-
-        return tf.reduce_mean(loss)
-
-    def compile(self, lr, loss="ce"):
-        opt = AdamW(learning_rate=lr)
-        if loss == "ce":
-            self.model.compile(optimizer=opt, loss=self.masked_ce)
+    def compile(self):
+        opt = AdamW(learning_rate=self.lr)
+        if self.loss == "ce":
+            self.model.compile(
+                optimizer=opt,
+                loss=MaskedCELoss(
+                    weight=self.weight,
+                    weight_0=self.weight_0,
+                    weight_1=self.weight_1,
+                    weight_2=self.weight_2
+                )
+            )
         else:
-            # multi_class_focal_loss
-            self.model.compile(optimizer=opt, loss=self.multi_class_focal_loss)
+            self.model.compile(
+                optimizer=opt,
+                loss=MultiClassFocalLoss(
+                    weight=self.weight,
+                    weight_0=self.weight_0,
+                    weight_1=self.weight_1,
+                    weight_2=self.weight_2,
+                    gamma=self.gamma
+                )
+            )
 
-    def train(self, x, model_path=None, epochs=1000, batch_size=64, val_split=0.2, save_means_path=None):
+    def train(self, x, batch_size, val_split, model_path=None, epochs=1000, save_means_path=None, results_dir=None):
         """
         Train the autoencoder and save results in a timestamped folder under `results/`.
 
-        model_path: optional string used as part of the folder/name (can be a filename).
-        save_means_path: optional path to also save `snp_means.npy`
-        Returns: (history, result_dir)
+        Args:
+            x: training data (numpy array)
+            batch_size: batch size
+            val_split: fraction for validation split
+            model_path: optional filename to include in results folder and model save
+            epochs: number of training epochs
+            save_means_path: optional path to save SNP means (.npy)
+
+        Returns:
+            history: Keras History object
+            result_dir: path to results folder
         """
+        # compute SNP means
         self.snp_means = np.mean(x, axis=0)
-        # split train/val
-        n_val = int(len(x) * val_split)
-        x_train, x_val = x[:-n_val], x[-n_val:]
-        mask_train, mask_val = self.mask_miss[:-n_val], self.mask_miss[-n_val:]
 
-        train_ds = MaskedDataset(x_train, mask_train, batch_size)
-        val_ds = MaskedDataset(x_val, mask_val, batch_size)
+        # prepare train and validation datasets
+        train_ds, val_ds = create_train_val_datasets(
+            x=x,
+            mask=self.mask_miss,
+            batch_size=batch_size,
+            val_split=val_split
+        )
+        
+        f1_cb = F1MacroCallback(
+            val_data=val_ds.x,
+            mask_data=val_ds.mask
+        )
 
-        # prepare results folder per-run to avoid clutter
+        # create timestamped results folder
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        provided_name = "model"
-        if model_path is not None:
-            try:
-                provided_name = Path(model_path).stem
-            except Exception:
-                provided_name = str(model_path)
-
-        result_dir = Path("results") / f"model_CAE_{timestamp}_{provided_name}"
+        name = Path(model_path).stem if model_path else "model"
+        if results_dir is None:
+            result_dir = Path("results") / f"model_CAE_{timestamp}_{name}"
+        else:
+            result_dir = Path(results_dir)
         result_dir.mkdir(parents=True, exist_ok=True)
 
-        # callbacks: save best model inside the run folder
+        # setup callbacks
         checkpoint_cb = ModelCheckpoint(
-            filepath=str(result_dir / "checkpoint_best.keras"), monitor='val_loss', save_best_only=True, mode='min'
+            filepath=result_dir / "checkpoint_best.keras",
+            monitor='val_loss',
+            save_best_only=True,
+            mode='min'
         )
-        earlystop = EarlyStopping(monitor='val_loss', patience=4, min_delta=1e-2, restore_best_weights=True)
+        earlystop_cb = EarlyStopping(
+            monitor='val_loss',
+            patience=4,
+            min_delta=1e-2,
+            restore_best_weights=True
+        )
 
+        # train the model
         history = self.model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=epochs,
             verbose=0,
-            callbacks=[checkpoint_cb, earlystop, TqdmCallback(verbose=1)]
+            callbacks=[checkpoint_cb, earlystop_cb, TqdmCallback(verbose=1), f1_cb]
         )
 
-        # save final model and artifacts inside the run folder
-        model_save_path = result_dir / f"{provided_name}.keras"
+        # save final model
+        model_save_path = result_dir / f"{name}.keras"
         self.model.save(model_save_path)
 
         # save SNP means
-        means_save_path = result_dir / "snp_means.npy"
-        if self.snp_means is not None:
-            np.save(means_save_path, self.snp_means)
-            if save_means_path is not None and Path(save_means_path).resolve() != means_save_path.resolve():
-                try:
-                    np.save(save_means_path, self.snp_means)
-                except Exception:
-                    pass
+        means_save_path_local = result_dir / save_means_path
+        np.save(means_save_path_local, self.snp_means)
 
-        # write run parameters to params.txt for reproducibility
+        # save training parameters
         params = {
-            'timestamp': timestamp,
-            'provided_name': provided_name,
-            'num_snps': int(self.num_snps),
-            'epochs': int(epochs),
-            'batch_size': int(batch_size),
-            'val_split': float(val_split),
-            'weight': float(self.weight),
-            'weight_0': float(self.weight_0),
-            'weight_1': float(self.weight_1),
-            'weight_2': float(self.weight_2),
-            'window_size': int(self.window_size),
-            'embed_dim': int(self.embed_dim)
+            "timestamp": timestamp,
+            "provided_name": name,
+            "export_model_name": str(self.export_model_name),
+            "loss": self.loss, 
+            "num_snps": int(self.num_snps),
+            "epochs": int(epochs),
+            "batch_size": int(batch_size),
+            "val_split": float(val_split),
+            "weight": float(self.weight),
+            "weight_0": float(self.weight_0),
+            "weight_1": float(self.weight_1),
+            "weight_2": float(self.weight_2),
+            "mult_1": float(self.mult_1),
+            "mult_2": float(self.mult_2),
+            "gamma": float(self.gamma),
+            "window_size": int(self.window_size),
+            "embed_dim": int(self.embed_dim),
+            "strides": int(self.strides),
+            "activation": str(self.activation),
+            "lr": float(self.lr),
+            "padding": str(self.padding),
+            "dropout_rate": float(self.dropout_rate),
+            "l2_factor": float(self.l2_factor),
+            "learning_rate": getattr(self.model.optimizer, 'learning_rate', 'unknown'),
+            "model_params": self.model.count_params()
         }
-        # try to read optimizer lr if available
-        try:
-            lr = self.model.optimizer.learning_rate
-            # convert tensor/ schedule to string/value
-            try:
-                params['learning_rate'] = float(lr)
-            except Exception:
-                params['learning_rate'] = str(lr)
-        except Exception:
-            params['learning_rate'] = 'unknown'
-
-        params_file = result_dir / 'params.txt'
-        with open(params_file, 'w') as fh:
+        with open(result_dir / 'params.txt', 'w') as f:
             for k, v in params.items():
-                fh.write(f"{k}: {v}\n")
+                f.write(f"{k}: {v}\n")
 
         self.loss_history = history.history.get('loss', [])
+
+        # save best val loss & F1 macro 
+        # print(history.history.keys())
+
+        best_val_loss = min(history.history["val_loss"])
+        best_epoch = int(np.argmin(history.history["val_loss"]))
+        f1_at_best_loss = history.history["f1_macro"][best_epoch]
+        csv_path = Path(result_dir) / "train_metrics.csv"
+        with open(csv_path, "w") as f:
+            f.write("model,model_path,val_loss_best,val_f1_macro,best_epoch\n")
+            f.write(f"{str(self.export_model_name)},{str(model_save_path)},{best_val_loss},{f1_at_best_loss},{best_epoch}\n")
+
         return history, str(result_dir)
 
-    def _visual_eval(self, predict_missing, true_missing):
-        all_preds = np.argmax(predict_missing, axis=-1).astype(int)
-        all_labels = true_missing.astype(int)
-
-        if self.loss_history is not None and len(self.loss_history) > 0:
-            plt.figure(figsize=(6,4))
-            plt.plot(self.loss_history)
-            plt.title('Training loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.show()
-
-        # confusion matrix
-        cm = confusion_matrix(all_labels, all_preds)
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        disp.plot(cmap=plt.cm.Blues, ax=ax)
-        plt.title("Confusion Matrix on missing positions")
-        plt.show()
-
-    def build_model(self, activation='relu', dropout=0.2):
-        """ Conv1D Autoencoder for SNP imputation. """
+    def build_model(self, rate = 2):
         input_layer = Input(shape=(self.num_snps,))
         x = Reshape((self.num_snps, 1))(input_layer)  # Conv expects 3D: (batch, length, channels)
 
-        # --- Encoder ---
-        x = Conv1D(self.embed_dim * 4, self.window_size, activation=activation, padding='same')(x)
-        x = Conv1D(self.embed_dim * 2, self.window_size, activation=activation, padding='same')(x)
-        x = Conv1D(self.embed_dim, self.window_size, activation=activation, padding='same')(x)
+        # Encoder
+        # x = Conv1D(self.embed_dim * 2 * rate, self.window_size, activation=self.activation, strides=self.strides, padding=self.padding)(x)
+        x = Conv1D(self.embed_dim * rate, self.window_size, activation=self.activation, strides=self.strides, padding=self.padding)(x)
+        x = Conv1D(self.embed_dim, self.window_size, activation=self.activation, strides=self.strides, padding=self.padding)(x)
         x = BatchNormalization()(x)
-        x = SpatialDropout1D(dropout)(x)
+        x = SpatialDropout1D(self.dropout_rate)(x)
 
-        # bottleneck
+        # Bottleneck
         x = Flatten()(x)
-        encoded = Dense(self.embed_dim * 4, activation=activation, kernel_regularizer=l2(1e-4))(x)
+        encoded = Dense(self.embed_dim, activation=self.activation, kernel_regularizer=l2(self.l2_factor))(x)
 
-        # --- Decoder ---
-        x = Dense(self.num_snps * self.embed_dim, activation=activation)(encoded)
+        # Decoder
+        x = Dense(self.num_snps * self.embed_dim, activation=self.activation)(encoded)
         x = Reshape((self.num_snps, self.embed_dim))(x)
-        x = Conv1DTranspose(self.embed_dim * 2, self.window_size, padding='same', activation=activation)(x)
-        x = Conv1DTranspose(self.embed_dim * 4, self.window_size, padding='same', activation=activation)(x)
-
+        x = Conv1DTranspose(self.embed_dim * rate, self.window_size, strides=self.strides, padding=self.padding, activation=self.activation)(x)
+        # x = Conv1DTranspose(self.embed_dim * 2 * rate, self.window_size, strides=self.strides, padding=self.padding, activation=self.activation)(x)
+        
         # Final layer: project back to 3 genotype probabilities per SNP
-        logits = Conv1D(3, 1, padding='same', kernel_regularizer=l2(1e-4))(x)
+        x = Flatten()(x) 
+        x = Dense(self.num_snps * 3, activation='linear', kernel_regularizer=l2(self.l2_factor))(x)  
+        logits = Reshape((self.num_snps, 3))(x) 
         probs = Softmax(axis=-1)(logits)
 
         return Model(inputs=input_layer, outputs=probs)
-    
-    def _compute_masked_maf(self, dataMAF, mask_miss, maf_threshold=0.05):
-        """
-        rare variant flags of missing SNPs.
-        dataMAF[i] = [freq_major, freq_minor] for SNP i.
-        mask_miss = binary mask (1 if SNP i is masked/missing, 0 if not).
-        maf_threshold = cutoff for rare
-        """
-        mask_miss = tf.convert_to_tensor(mask_miss, dtype=tf.float32)
-        mask_flat = tf.reshape(mask_miss[0], [-1])  # shape (1, n_snps)
 
 
-        p = np.sum(dataMAF * mask_flat.numpy()[:, None], axis=1)
-        p_min = np.min(dataMAF, axis=1)
-        valid_mask = p > 0
-        p_min_valid = p_min[valid_mask]
-        is_rare = (p_min_valid <= maf_threshold).astype(int)
-
-        mafMISS = np.column_stack((p_min_valid, is_rare))
-        return mafMISS
-    
-    def _maf_stratified_metrics(self, trueMISS, discrete_predict, dataMAF, mask_missing):
-        """
-        Compute genotype performance stratified by MAF threshold)
-        """
-        # --- Step 1. Compute SNP rarity flags (0 = common, 1 = rare)
-        maf_groups = self._compute_masked_maf(dataMAF, mask_missing, maf_threshold=self.MAF_threshold)
-        rare_flags = maf_groups[:, 1]
-        
-        # --- Step 2. Expand rarity flags to match flattened genotype data
-        n_individuals = len(trueMISS) // len(rare_flags)
-        if len(trueMISS) % len(rare_flags) != 0:
-            raise ValueError(f"trueMISS length ({len(trueMISS)}) not divisible by SNP count ({len(rare_flags)}).")
-        rare_flags_full = np.tile(rare_flags, n_individuals)
-
-        # --- Step 3. Evaluate separately for rare/common SNPs
-        results = {}
-        for label, desc in zip([0, 1], ["Common", "Rare"]):
-            mask = rare_flags_full == label
-            t, p = trueMISS[mask], discrete_predict[mask]
-
-            f1_micro = f1_score(t, p, average='micro')
-            f1_macro = f1_score(t, p, average='macro')
-            report = classification_report(t, p, digits=3, output_dict=False, zero_division=0)
-            cm = confusion_matrix(t, p)
-
-            results[label] = {
-                "desc": desc,
-                "report": report,
-                "f1_micro": f1_micro,
-                "f1_macro": f1_macro,
-                "confusion_matrix": cm
-            }
-
-        return results
-
-
-    def eval(self, data_missing, data_full, data_maf=None, snp_means=None, visualize=False, model_path=None, save_parent_dir=None):
+    def eval(self, data_missing, data_full, data_maf=None, snp_means=None, model_path=None, save_parent_dir=None, dataset_name=""):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        # If a parent directory is provided, create the eval folder inside it.
-        if save_parent_dir is not None:
-            save_dir = Path(save_parent_dir) / f"eval_{timestamp}"
-        else:
-            save_dir = Path("results") / f"eval_{timestamp}"
+        save_dir = Path(save_parent_dir) if save_parent_dir else Path("results")
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        if model_path is not None:
-            model_to_use = load_model(model_path, compile=False)
-        else:
-            model_to_use = self.model
+        # load model
+        model_to_use = load_model(model_path, compile=False) if model_path else self.model
+        n_params = model_to_use.count_params()
 
+        # snp means
         if snp_means is None:
             if self.snp_means is not None:
                 snp_means = self.snp_means
             else:
-                raise ValueError("No snp_means provided and none available in object. Provide --means-path or run training first.")
+                raise ValueError("No snp_means provided or in object.")
 
-        # fill missing values (3) with snp_means
+        # fill missing positions
         mask_missing = (data_missing == 3.)
         data_missing_filled = np.where(mask_missing, snp_means, data_missing)
 
         # predict
-        predicted = model_to_use.predict(data_missing_filled, verbose=0)  # shape (N, num_snps, 3)
+        predicted = model_to_use.predict(data_missing_filled, verbose=0)
         mask_missing_bool = mask_missing.astype(bool)
-
-        # gather predictions and true labels at missing positions
-        predict_missing = predicted[mask_missing_bool]  # (num_missing_positions, 3)
-        true_missing = data_full[mask_missing_bool]     # (num_missing_positions,)
+        predict_missing = predicted[mask_missing_bool]
+        true_missing = data_full[mask_missing_bool]
 
         discrete_predict = np.argmax(predict_missing, axis=-1).astype(int)
-
-        if visualize:
-            self._visual_eval(predict_missing, true_missing)
-
-        # classification metrics
         all_labels = true_missing.astype(int)
+
+        # --- console prints ---
         typer.secho("\nClassification Report for missing SNPs:", fg=typer.colors.BRIGHT_MAGENTA)
         print(classification_report(all_labels, discrete_predict, digits=3, zero_division=0))
+
         correct = (discrete_predict == all_labels).sum()
         total = all_labels.size
         print(f"Correct predictions: {correct} / {total} ({correct / total * 100:.2f}%)")
 
         f1_micro = f1_score(all_labels, discrete_predict, average='micro')
         f1_macro = f1_score(all_labels, discrete_predict, average='macro')
-        f1_per_class = f1_score(all_labels, discrete_predict, average=None)
-        acc = accuracy_score(true_missing, discrete_predict)
-        report = classification_report(true_missing, discrete_predict, digits=3, zero_division=0)
+        f1_per_class = f1_score(all_labels, discrete_predict, labels=[0,1,2], average=None)
 
+        acc = accuracy_score(all_labels, discrete_predict)
+        typer.echo(typer.style(f"Model params: {n_params}", fg=typer.colors.BRIGHT_CYAN, bold=True))
+        typer.echo(typer.style(f"Accuracy: {acc:.4f}", fg=typer.colors.BRIGHT_CYAN, bold=True))
         typer.echo(typer.style(f"F1 (micro): {f1_micro:.4f}", fg=typer.colors.BRIGHT_CYAN, bold=True))
         typer.echo(typer.style(f"F1 (macro): {f1_macro:.4f}", fg=typer.colors.BRIGHT_CYAN, bold=True))
         typer.echo(typer.style(f"F1 per class [0,1,2]: {f1_per_class}", fg=typer.colors.BRIGHT_CYAN, bold=True))
 
-        # confusion matrix
-        cm = confusion_matrix(all_labels, discrete_predict)
-        TP = np.diag(cm)
-        FP = cm.sum(axis=0) - TP
-        FN = cm.sum(axis=1) - TP
-        TN = cm.sum() - (FP + FN + TP)
-        typer.secho("\n=== Confusion Matrix Details ===", fg=typer.colors.BRIGHT_MAGENTA)
-        for i in range(len(TP)):
-            print(f"Class {i}: TP={TP[i]}, FP={FP[i]}, FN={FN[i]}, TN={TN[i]}")
-        print("\nOverall:")
-        print(f"TP={TP.sum()}, FP={FP.sum()}, FN={FN.sum()}, TN={TN.sum()}")
-
-        # --- optional MAF-based analysis ---
+        # --- optional MAF analysis ---
         if data_maf is not None:
             typer.secho("\n=== Stratified by MAF ===", fg=typer.colors.BRIGHT_MAGENTA)
-            metrics = self._maf_stratified_metrics(true_missing, discrete_predict, data_maf, mask_missing)[1]
+            metrics = maf_stratified_metrics(all_labels, discrete_predict, data_maf, mask_missing)
             print("Rare SNPs positions:")
             print("  Classification report:")
             print(metrics['report'])
@@ -586,25 +334,19 @@ class SNP_Autoencoder:
             print(metrics["confusion_matrix"])
             print("---------------------------------------------------\n")
 
-        # save main metrics
-        csv_path = save_dir / f"{timestamp}_CAEeval_results.csv"
+        # --- save simplified CSV ---
+        csv_path = save_dir / "snp_eval_metrics.csv"
+        file_exists = csv_path.exists()
+        row = [str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro,
+            f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params]
 
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"])
+            writer.writerow(row)
 
-        df = pd.DataFrame({
-            "metric": ["accuracy", "f1_micro", "f1_macro", "f1_class_0", "f1_class_1", "f1_class_2", "classification_report"],
-            "value": [
-                acc,
-                f1_micro,
-                f1_macro,
-                f1_per_class[0],
-                f1_per_class[1],
-                f1_per_class[2],
-                report
-            ]
-        })
-
-        df.to_csv(csv_path, index=False)
-
+        typer.secho(f"Saved simplified metrics to {csv_path}", fg=typer.colors.BRIGHT_GREEN)
 
         return {
             "predict_missing": predict_missing,
@@ -624,42 +366,96 @@ def train(
     lr: float = typer.Option(1e-4, help="Learning rate."),
     mult_1: float = typer.Option(2.3, help="Maximum oversampling for genotype 1 in mask."),
     mult_2: float = typer.Option(2.6, help="Maximum oversampling for genotype 2 in mask."),
-    window_size: int = typer.Option(15, help="Window size for convolutional layers."),
-    embed_dim: int = typer.Option(16, help="Dimention of embedding.")
+    window_size: int = typer.Option(31, help="Window size for convolutional layers."),
+    embed_dim: int = typer.Option(8, help="Dimention of embedding."),
+    gpu: bool = typer.Option(True, help="Whether to use GPU (default True). If False, forces CPU training."),
+    dropout_rate: float = typer.Option(0.2, help="Dropout rate for Conv layers."),
+    activation: str = typer.Option("relu", help="Activation function"),
+    padding: str = typer.Option("same", help="Conv padding"),
+    strides: int = typer.Option(3, help="Conv strides"),
+    gamma: float = typer.Option(1.45, help="Gamma for focal loss"),
+    MAF_threshold: float = typer.Option(0.05, help="MAF threshold for filtering"),
+    val_split: float = typer.Option(0.2, help="Validation split"),
+    results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
+    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
+    export_model_name: str = typer.Option("CAE", help="Model name for saving in output csv results.")
 ):
-    # Read data
-    dataTRAIN = read_csv_array(train_path)
-    if miss_path is not None:
-        dataMISS = read_csv_array(miss_path)
+    # =======================
+    # GPU / CPU device setup
+    # =======================
+    if gpu:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for g in gpus:
+                    tf.config.experimental.set_memory_growth(g, True)
+                typer.secho(f"[INFO] Using GPU(s): {len(gpus)}", fg=typer.colors.BRIGHT_GREEN)
+            except Exception as e:
+                typer.secho(f"[WARNING] Could not set GPU memory growth: {e}", fg=typer.colors.YELLOW)
+        else:
+            typer.secho("[INFO] No GPU detected; using CPU.", fg=typer.colors.BRIGHT_YELLOW)
     else:
-        dataMISS = None
+        # force CPU
+        tf.config.set_visible_devices([], 'GPU')
+        typer.secho("[INFO] GPU disabled; training on CPU.", fg=typer.colors.BRIGHT_YELLOW)
 
+    # =======================
+    # Read data
+    # =======================
+    dataTRAIN = read_csv_array(train_path)
+    dataMISS = read_csv_array(miss_path) if miss_path else None
     if dataTRAIN is None:
         raise typer.BadParameter("Missing required input files (--train-path).")
-
 
     num_snps = dataTRAIN.shape[1]
     typer.secho(f"[INFO] Train data shape: {dataTRAIN.shape}", fg=typer.colors.BRIGHT_GREEN)
 
+
+    # =======================
+    # Train
+    # =======================
     # balance masked genotypes
     typer.secho("[INFO] Mask creation...", fg=typer.colors.BRIGHT_GREEN)
     mask_miss, w0, w1, w2 = prepare_balanced_mask(dataTRAIN, dataMISS, mult_1=mult_1, mult_2=mult_2)
 
+    # prepare and train model
     typer.secho("[INFO] Starting training...", fg=typer.colors.BRIGHT_GREEN)
-    # prepare model
     snp_ae = SNP_Autoencoder(
         num_snps=num_snps,
         mask_miss=mask_miss,
         weight=weight,
-        weight_0=w0, weight_1=w1, weight_2=w2,
-        window_size = window_size,
-        embed_dim = embed_dim
+        weight_0=w0,
+        weight_1=w1,
+        weight_2=w2,
+        window_size=window_size,
+        embed_dim=embed_dim,
+        lr=lr,
+        dropout_rate=dropout_rate,
+        activation=activation,
+        padding=padding,
+        strides=strides,
+        gamma=gamma,
+        MAF_threshold=MAF_threshold,
+        l2_factor=l2_factor,
+        loss=loss,
+        export_model_name=export_model_name,
+        mult_1=mult_1,
+        mult_2=mult_2
     )
-    snp_ae.compile(lr=lr)
-    history, run_dir = snp_ae.train(dataTRAIN, model_path=save_model, epochs=epochs, batch_size=batch_size, save_means_path=save_means)
+    _, run_dir = snp_ae.train(
+        dataTRAIN,
+        model_path=save_model,
+        epochs=epochs,
+        batch_size=batch_size,
+        save_means_path=save_means,
+        val_split=val_split,
+        results_dir=results_dir
+    )
 
     typer.secho(f"[INFO] Run artifacts saved to: {run_dir}", fg=typer.colors.BRIGHT_GREEN)
     typer.secho(f"[SUCCESS] Training finished. Saved best model and artifacts in: {run_dir}", fg=typer.colors.BRIGHT_CYAN, bold=True)
+
     return str(run_dir)
 
 @app.command() 
@@ -669,8 +465,8 @@ def eval(
     maf_path: str = typer.Option(None, help="[Optional] MAF scores for evaluation."),
     model_path: str = typer.Option("autoencoder_best.keras", help="Path to trained model (.keras)"),
     means_path: str = typer.Option(None, help="Path to SNP means (.npy). If not provided, must run training within same process."),
-    visualize: bool = typer.Option(False, help="Show confusion matrix and loss plot"),
-    eval_parent_dir: str = typer.Option(None, help="Optional parent directory to place eval outputs (e.g., training run dir). If provided, eval results will be written to <parent>/eval_<timestamp>.")
+    eval_parent_dir: str = typer.Option(None, help="Optional parent directory to place eval outputs (e.g., training run dir). If provided, eval results will be written to <parent>/eval_<timestamp>."),
+    export_model_name: str = typer.Option("CAE", help="Model name for saving in output csv results.")
 ):
     dataMISS = read_csv_array(test_path)
     dataFULL = read_csv_array(full_path)
@@ -695,8 +491,8 @@ def eval(
         snp_means = np.ones(num_snps) * 1.5
         
     typer.secho("[INFO] Predicting on test dataset...", fg=typer.colors.BRIGHT_GREEN)
-    snp_ae = SNP_Autoencoder(num_snps=num_snps)
-    snp_ae.eval(data_missing=dataMISS, data_full=dataFULL, data_maf=dataMAF, snp_means=snp_means, visualize=visualize, model_path=model_path, save_parent_dir=eval_parent_dir)
+    snp_ae = SNP_Autoencoder(num_snps=num_snps, export_model_name=export_model_name)
+    snp_ae.eval(data_missing=dataMISS, data_full=dataFULL, data_maf=dataMAF, snp_means=snp_means, model_path=model_path, save_parent_dir=eval_parent_dir, dataset_name=test_path)
     typer.secho("[SUCCESS] Evaluation complete.", fg=typer.colors.BRIGHT_CYAN, bold=True)
 
 @app.command("train-and-eval")
@@ -713,9 +509,20 @@ def train_and_eval(
     lr: float = typer.Option(1e-4, help="Learning rate."),
     mult_1: float = typer.Option(2.3, help="Oversampling multiplier for genotype 1."),
     mult_2: float = typer.Option(2.6, help="Oversampling multiplier for genotype 2."),
-    visualize: bool = typer.Option(False, help="Visualize confusion matrix and loss plots."),
-    window_size: int = typer.Option(15, help="Window size for convolutional layers."),
-    embed_dim: int = typer.Option(16, help="Dimention of embedding.")
+    window_size: int = typer.Option(31, help="Window size for convolutional layers."),
+    embed_dim: int = typer.Option(8, help="Dimention of embedding."),
+    gpu: bool = typer.Option(True, help="Whether to use GPU (default True). If False, forces CPU training."),
+    dropout_rate: float = typer.Option(0.2, help="Dropout rate for Conv layers."),
+    activation: str = typer.Option("relu", help="Activation function"),
+    padding: str = typer.Option("same", help="Conv padding"),
+    strides: int = typer.Option(3, help="Conv strides"),
+    gamma: float = typer.Option(1.45, help="Gamma for focal loss"),
+    MAF_threshold: float = typer.Option(0.05, help="MAF threshold for filtering"),
+    val_split: float = typer.Option(0.2, help="Validation split"),
+    results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
+    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
+    export_model_name: str = typer.Option("CAE", help="Model name for saving in output csv results.")
 ):
     """
     Train the SNP autoencoder and immediately evaluate it on a test dataset.
@@ -733,7 +540,19 @@ def train_and_eval(
         mult_1=mult_1,
         mult_2=mult_2,
         window_size=window_size,
-        embed_dim=embed_dim
+        embed_dim=embed_dim,
+        gpu=gpu,
+        dropout_rate=dropout_rate,
+        activation=activation,
+        padding=padding,
+        strides=strides,
+        gamma=gamma,
+        MAF_threshold=MAF_threshold,
+        val_split=val_split,
+        results_dir=results_dir,
+        l2_factor=l2_factor,
+        loss=loss,
+        export_model_name=export_model_name
     )
 
     model_path_in_run = Path(run_dir) / Path(save_model).name
@@ -745,8 +564,8 @@ def train_and_eval(
         maf_path=maf_path,
         model_path=str(model_path_in_run),
         means_path=str(means_path_in_run),
-        visualize=visualize,
         eval_parent_dir=str(run_dir),
+        export_model_name=export_model_name
     )
 
 if __name__ == "__main__":
