@@ -1,0 +1,37 @@
+# ignore all data & results files
+data/
+results/
+optuna_runs/
+trial_*/
+*.cvf
+*.csv
+*.png
+*.keras
+*.txt
+
+# ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
+# ignore logs and temporary files
+*.log
+*.tmp
+*.swp
+.bin/
+
+# ignore Rstudio history
+.Rhistory
+
+# other
+*.onnx*
+*.fam
+*.bim
+*.afreq
+*.bed
+vcf_subset
+*.vcf

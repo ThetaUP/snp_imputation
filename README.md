@@ -14,21 +14,9 @@ Input files:
 
 ## 1. Convolutional AutoEncoder (CAE)
 
-**Run:**
 ```powershell
  python CAE_imputation.py --help
  python CAE_imputation.py train-and-eval --help
- ```
-
-**Examples:**
-
-Train a model (example):
- ```powershell
- python CAE_imputation.py train \
-   --train-path data/genotypes.csv \
-   --miss-path data/genotypesTest.csv \
-   --save-model autoencoder_best.keras \
-   --batch-size 128 
  ```
 
 ## 2. BERT
