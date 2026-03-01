@@ -6,6 +6,7 @@ import os
 import warnings
 from pathlib import Path
 from datetime import datetime
+import time
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -157,9 +158,13 @@ class SNP_Autoencoder:
             monitor="val_loss", patience=4, min_delta=1e-2, restore_best_weights=True
         )
 
+        start_time = time.perf_counter()
         history = self.model.fit(
             train_ds, validation_data=val_ds, epochs=epochs, verbose=0, callbacks=[checkpoint_cb, earlystop_cb, TqdmCallback(verbose=1), f1_cb]
         )
+        end_time = time.perf_counter()
+        train_time_sec = end_time - start_time
+        train_time_min = train_time_sec / 60
 
         model_save_path = result_dir / f"{name}.keras"
         self.model.save(model_save_path)
@@ -189,7 +194,9 @@ class SNP_Autoencoder:
             "lr": float(self.lr),
             "l2_factor": float(self.l2_factor),
             "learning_rate": getattr(self.model.optimizer, 'learning_rate', 'unknown'),
-            "model_params": self.model.count_params()
+            "model_params": self.model.count_params(),
+            "train_time_sec_total": float(train_time_sec),
+            "train_time_min_total": float(train_time_min)
         }
         with open(result_dir / 'params.txt', 'w') as f:
             for k, v in params.items():
@@ -230,7 +237,12 @@ class SNP_Autoencoder:
         mask_missing = (data_missing == 3.)
         data_missing_filled = np.where(mask_missing, snp_means, data_missing)
 
+        # predict
+        start_time = time.perf_counter()
         predicted = model_to_use.predict(data_missing_filled, verbose=0)
+        end_time = time.perf_counter()
+        eval_time_sec_total = end_time - start_time
+        eval_time_min_total = eval_time_sec_total / 60
 
         mask_missing_bool = mask_missing.astype(bool)
         predict_missing = predicted[mask_missing_bool]
@@ -239,7 +251,8 @@ class SNP_Autoencoder:
         discrete_predict = np.argmax(predict_missing, axis=-1).astype(int)
         all_labels = true_missing.astype(int)
 
-        print("\nClassification Report for missing SNPs:")
+        #print("\nClassification Report for missing SNPs:")
+        typer.secho("[EVAL] CClassification Report for missing SNPs:", fg=typer.colors.BRIGHT_MAGENTA)
         print(classification_report(all_labels, discrete_predict, digits=3, zero_division=0))
 
         acc = accuracy_score(all_labels, discrete_predict)
@@ -254,10 +267,37 @@ class SNP_Autoencoder:
         print(f"F1 per class [0,1,2]: {f1_per_class}")
 
         if data_maf is not None:
+            csv_pathMAF = save_dir / "MAF_snp_eval_metrics.csv"
+            file_existsMAF = csv_pathMAF.exists()
+
             metrics = maf_stratified_metrics(
                 all_labels, discrete_predict, data_maf, mask_missing
-            )
-            print(metrics["report"])
+            )[1]
+            typer.secho("[EVAL] Classification Report for rare SNPs", fg=typer.colors.BRIGHT_MAGENTA)
+            #print("\nClassification Report for rare SNPs:")
+            print(f"Description: {metrics['desc']}")
+            
+            print("Report:\n")
+            print(metrics['report'])
+            
+            print(f"F1 (micro): {metrics['f1_micro']:.4f}")
+            print(f"F1 (macro): {metrics['f1_macro']:.4f}\n")
+            print(f"F1 per class [0,1,2]: {metrics['f1_per_class']}")
+            
+            print("Confusion Matrix:")
+            print(metrics['confusion_matrix'])
+
+            with open(csv_pathMAF, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_existsMAF:
+                    writer.writerow(
+                        ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"]
+                    )
+                writer.writerow([
+                    str(self.export_model_name), str(model_path), timestamp, dataset_name, metrics['f1_micro'], metrics['f1_macro'], metrics['f1_per_class'][0], metrics['f1_per_class'][1], metrics['f1_per_class'][2], n_params
+                ])
+
+            typer.secho(f"[INFO] MAF evaluation report saved to '{csv_pathMAF}'", fg=typer.colors.GREEN)
 
         csv_path = save_dir / "snp_eval_metrics.csv"
         file_exists = csv_path.exists()
@@ -266,11 +306,13 @@ class SNP_Autoencoder:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(
-                    ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"]
+                    ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params", "eval_time_sec_total", "eval_time_min_total"]
                 )
             writer.writerow([
-                str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro, f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params
+                str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro, f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params, eval_time_sec_total, eval_time_min_total
             ])
+
+        typer.secho(f"[INFO] Evaluation report saved to '{csv_path}'", fg=typer.colors.GREEN)
 
         return {
             "predict_missing": predict_missing, "true_missing": true_missing, "discrete_predict": discrete_predict

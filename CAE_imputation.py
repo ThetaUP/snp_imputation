@@ -6,6 +6,7 @@ import os
 import warnings
 from pathlib import Path
 from datetime import datetime
+import time
 
 # os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
@@ -180,6 +181,7 @@ class SNP_Autoencoder:
         )
 
         # train the model
+        start_time = time.perf_counter()
         history = self.model.fit(
             train_ds,
             validation_data=val_ds,
@@ -187,6 +189,9 @@ class SNP_Autoencoder:
             verbose=0,
             callbacks=[checkpoint_cb, earlystop_cb, TqdmCallback(verbose=1), f1_cb]
         )
+        end_time = time.perf_counter()
+        train_time_sec = end_time - start_time
+        train_time_min = train_time_sec / 60
 
         # save final model
         model_save_path = result_dir / f"{name}.keras"
@@ -222,7 +227,9 @@ class SNP_Autoencoder:
             "dropout_rate": float(self.dropout_rate),
             "l2_factor": float(self.l2_factor),
             "learning_rate": getattr(self.model.optimizer, 'learning_rate', 'unknown'),
-            "model_params": self.model.count_params()
+            "model_params": self.model.count_params(),
+            "train_time_sec_total": float(train_time_sec),
+            "train_time_min_total": float(train_time_min)
         }
         with open(result_dir / 'params.txt', 'w') as f:
             for k, v in params.items():
@@ -294,7 +301,12 @@ class SNP_Autoencoder:
         data_missing_filled = np.where(mask_missing, snp_means, data_missing)
 
         # predict
+        start_time = time.perf_counter()
         predicted = model_to_use.predict(data_missing_filled, verbose=0)
+        end_time = time.perf_counter()
+        eval_time_sec_total = end_time - start_time
+        eval_time_min_total = eval_time_sec_total / 60
+
         mask_missing_bool = mask_missing.astype(bool)
         predict_missing = predicted[mask_missing_bool]
         true_missing = data_full[mask_missing_bool]
@@ -323,27 +335,48 @@ class SNP_Autoencoder:
 
         # --- optional MAF analysis ---
         if data_maf is not None:
-            typer.secho("\n=== Stratified by MAF ===", fg=typer.colors.BRIGHT_MAGENTA)
-            metrics = maf_stratified_metrics(all_labels, discrete_predict, data_maf, mask_missing)
-            print("Rare SNPs positions:")
-            print("  Classification report:")
+            csv_pathMAF = save_dir / "MAF_snp_eval_metrics.csv"
+            file_existsMAF = csv_pathMAF.exists()
+
+            metrics = maf_stratified_metrics(
+                all_labels, discrete_predict, data_maf, mask_missing
+            )[1]
+            typer.secho("[EVAL] Classification Report for rare SNPs", fg=typer.colors.BRIGHT_MAGENTA)
+            #print("\nClassification Report for rare SNPs:")
+            print(f"Description: {metrics['desc']}")
+            
+            print("Report:\n")
             print(metrics['report'])
-            print(f"  F1-micro : {metrics['f1_micro']:.4f}")
-            print(f"  F1-macro : {metrics['f1_macro']:.4f}")
-            print("  Confusion matrix:")
-            print(metrics["confusion_matrix"])
-            print("---------------------------------------------------\n")
+            
+            print(f"F1 (micro): {metrics['f1_micro']:.4f}")
+            print(f"F1 (macro): {metrics['f1_macro']:.4f}\n")
+            print(f"F1 per class [0,1,2]: {metrics['f1_per_class']}")
+            
+            print("Confusion Matrix:")
+            print(metrics['confusion_matrix'])
+
+            with open(csv_pathMAF, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_existsMAF:
+                    writer.writerow(
+                        ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"]
+                    )
+                writer.writerow([
+                    str(self.export_model_name), str(model_path), timestamp, dataset_name, metrics['f1_micro'], metrics['f1_macro'], metrics['f1_per_class'][0], metrics['f1_per_class'][1], metrics['f1_per_class'][2], n_params
+                ])
+
+            typer.secho(f"[INFO] MAF evaluation report saved to '{csv_pathMAF}'", fg=typer.colors.GREEN)
 
         # --- save simplified CSV ---
         csv_path = save_dir / "snp_eval_metrics.csv"
         file_exists = csv_path.exists()
         row = [str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro,
-            f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params]
+            f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params, eval_time_sec_total, eval_time_min_total]
 
         with open(csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"])
+                writer.writerow(["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params", "eval_time_sec_total", "eval_time_min_total"])
             writer.writerow(row)
 
         typer.secho(f"Saved simplified metrics to {csv_path}", fg=typer.colors.BRIGHT_GREEN)
@@ -364,20 +397,20 @@ def train(
     batch_size: int = typer.Option(128, help="Batch size."),
     weight: float = typer.Option(0.0, help="If 0 then only masked positions are considered in loss."),
     lr: float = typer.Option(1e-4, help="Learning rate."),
-    mult_1: float = typer.Option(2.3, help="Maximum oversampling for genotype 1 in mask."),
-    mult_2: float = typer.Option(2.6, help="Maximum oversampling for genotype 2 in mask."),
-    window_size: int = typer.Option(31, help="Window size for convolutional layers."),
-    embed_dim: int = typer.Option(8, help="Dimention of embedding."),
+    mult_1: float = typer.Option(2.6, help="Maximum oversampling for genotype 1 in mask."),
+    mult_2: float = typer.Option(2.4, help="Maximum oversampling for genotype 2 in mask."),
+    window_size: int = typer.Option(21, help="Window size for convolutional layers."),
+    embed_dim: int = typer.Option(16, help="Dimention of embedding."),
     gpu: bool = typer.Option(True, help="Whether to use GPU (default True). If False, forces CPU training."),
-    dropout_rate: float = typer.Option(0.2, help="Dropout rate for Conv layers."),
+    dropout_rate: float = typer.Option(0.25, help="Dropout rate for Conv layers."),
     activation: str = typer.Option("relu", help="Activation function"),
-    padding: str = typer.Option("same", help="Conv padding"),
+    padding: str = typer.Option("valid", help="Conv padding"),
     strides: int = typer.Option(3, help="Conv strides"),
     gamma: float = typer.Option(1.45, help="Gamma for focal loss"),
     MAF_threshold: float = typer.Option(0.05, help="MAF threshold for filtering"),
     val_split: float = typer.Option(0.2, help="Validation split"),
     results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
-    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    l2_factor: float = typer.Option(0.0, help="L2 regularization factor"),
     loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
     export_model_name: str = typer.Option("CAE", help="Model name for saving in output csv results.")
 ):
@@ -507,20 +540,20 @@ def train_and_eval(
     batch_size: int = typer.Option(128, help="Batch size."),
     weight: float = typer.Option(0.0, help="If 0 then only masked positions are considered in loss."),
     lr: float = typer.Option(1e-4, help="Learning rate."),
-    mult_1: float = typer.Option(2.3, help="Oversampling multiplier for genotype 1."),
-    mult_2: float = typer.Option(2.6, help="Oversampling multiplier for genotype 2."),
-    window_size: int = typer.Option(31, help="Window size for convolutional layers."),
-    embed_dim: int = typer.Option(8, help="Dimention of embedding."),
+    mult_1: float = typer.Option(2.6, help="Oversampling multiplier for genotype 1."),
+    mult_2: float = typer.Option(2.4, help="Oversampling multiplier for genotype 2."),
+    window_size: int = typer.Option(21, help="Window size for convolutional layers."),
+    embed_dim: int = typer.Option(16, help="Dimention of embedding."),
     gpu: bool = typer.Option(True, help="Whether to use GPU (default True). If False, forces CPU training."),
-    dropout_rate: float = typer.Option(0.2, help="Dropout rate for Conv layers."),
+    dropout_rate: float = typer.Option(0.25, help="Dropout rate for Conv layers."),
     activation: str = typer.Option("relu", help="Activation function"),
-    padding: str = typer.Option("same", help="Conv padding"),
+    padding: str = typer.Option("valid", help="Conv padding"),
     strides: int = typer.Option(3, help="Conv strides"),
     gamma: float = typer.Option(1.45, help="Gamma for focal loss"),
     MAF_threshold: float = typer.Option(0.05, help="MAF threshold for filtering"),
     val_split: float = typer.Option(0.2, help="Validation split"),
     results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
-    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    l2_factor: float = typer.Option(0.0, help="L2 regularization factor"),
     loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
     export_model_name: str = typer.Option("CAE", help="Model name for saving in output csv results.")
 ):

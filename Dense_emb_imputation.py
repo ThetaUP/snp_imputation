@@ -6,6 +6,7 @@ import os
 import warnings
 from pathlib import Path
 from datetime import datetime
+import time
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -192,9 +193,13 @@ class SNP_Autoencoder:
             monitor="val_loss", patience=5, min_delta=1e-2, restore_best_weights=True
         )
 
+        start_time = time.perf_counter()
         history = self.model.fit(
             train_ds, validation_data=val_ds, epochs=epochs, verbose=0, callbacks=[checkpoint_cb, earlystop_cb, TqdmCallback(verbose=1), f1_cb]
         )
+        end_time = time.perf_counter()
+        train_time_sec = end_time - start_time
+        train_time_min = train_time_sec / 60
 
         model_save_path = result_dir / f"{name}.keras"
         self.model.save(model_save_path)
@@ -225,7 +230,9 @@ class SNP_Autoencoder:
             "l2_factor": float(self.l2_factor),
             "learning_rate": getattr(self.model.optimizer, 'learning_rate', 'unknown'),
             "pool_type": str(self.pool_type),
-            "model_params": self.model.count_params()
+            "model_params": self.model.count_params(),
+            "train_time_sec_total": float(train_time_sec),
+            "train_time_min_total": float(train_time_min)
         }
         with open(result_dir / 'params.txt', 'w') as f:
             for k, v in params.items():
@@ -266,7 +273,12 @@ class SNP_Autoencoder:
         mask_missing = (data_missing == 3.)
         data_missing_filled = np.where(mask_missing, snp_means, data_missing)
 
+        # predict
+        start_time = time.perf_counter()
         predicted = model_to_use.predict(data_missing_filled, verbose=0)
+        end_time = time.perf_counter()
+        eval_time_sec_total = end_time - start_time
+        eval_time_min_total = eval_time_sec_total / 60
 
         mask_missing_bool = mask_missing.astype(bool)
         predict_missing = predicted[mask_missing_bool]
@@ -275,7 +287,8 @@ class SNP_Autoencoder:
         discrete_predict = np.argmax(predict_missing, axis=-1).astype(int)
         all_labels = true_missing.astype(int)
 
-        print("\nClassification Report for missing SNPs:")
+        #print("\nClassification Report for missing SNPs:")
+        typer.secho("[EVAL] Classification Report for missing SNPs:", fg=typer.colors.BRIGHT_MAGENTA)
         print(classification_report(all_labels, discrete_predict, digits=3, zero_division=0))
 
         acc = accuracy_score(all_labels, discrete_predict)
@@ -290,10 +303,37 @@ class SNP_Autoencoder:
         print(f"F1 per class [0,1,2]: {f1_per_class}")
 
         if data_maf is not None:
+            csv_pathMAF = save_dir / "MAF_snp_eval_metrics.csv"
+            file_existsMAF = csv_pathMAF.exists()
+
             metrics = maf_stratified_metrics(
                 all_labels, discrete_predict, data_maf, mask_missing
-            )
-            print(metrics["report"])
+            )[1]
+            typer.secho("[EVAL] Classification Report for rare SNPs", fg=typer.colors.BRIGHT_MAGENTA)
+            #print("\nClassification Report for rare SNPs:")
+            print(f"Description: {metrics['desc']}")
+            
+            print("Report:\n")
+            print(metrics['report'])
+            
+            print(f"F1 (micro): {metrics['f1_micro']:.4f}")
+            print(f"F1 (macro): {metrics['f1_macro']:.4f}\n")
+            print(f"F1 per class [0,1,2]: {metrics['f1_per_class']}")
+            
+            print("Confusion Matrix:")
+            print(metrics['confusion_matrix'])
+
+            with open(csv_pathMAF, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_existsMAF:
+                    writer.writerow(
+                        ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"]
+                    )
+                writer.writerow([
+                    str(self.export_model_name), str(model_path), timestamp, dataset_name, metrics['f1_micro'], metrics['f1_macro'], metrics['f1_per_class'][0], metrics['f1_per_class'][1], metrics['f1_per_class'][2], n_params
+                ])
+
+            typer.secho(f"[INFO] MAF evaluation report saved to '{csv_pathMAF}'", fg=typer.colors.GREEN)
 
         csv_path = save_dir / "snp_eval_metrics.csv"
         file_exists = csv_path.exists()
@@ -302,11 +342,13 @@ class SNP_Autoencoder:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(
-                    ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params"]
+                    ["model", "model_path", "date", "dataset", "f1_micro", "f1_macro", "f1_0", "f1_1", "f1_2", "n_params", "eval_time_sec_total", "eval_time_min_total"]
                 )
             writer.writerow([
-                str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro, f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params
+                str(self.export_model_name), str(model_path), timestamp, dataset_name, f1_micro, f1_macro, f1_per_class[0], f1_per_class[1], f1_per_class[2], n_params, eval_time_sec_total, eval_time_min_total
             ])
+
+        typer.secho(f"[INFO] Evaluation report saved to '{csv_path}'", fg=typer.colors.GREEN)
 
         return {
             "predict_missing": predict_missing, "true_missing": true_missing, "discrete_predict": discrete_predict
@@ -325,19 +367,19 @@ def train(
     epochs: int = typer.Option(1000, help="Number of training epochs."),
     batch_size: int = typer.Option(16, help="Batch size."),
     weight: float = typer.Option(0.0, help="If 0 then only masked positions are considered in loss."),
-    lr: float = typer.Option(1e-4, help="Learning rate."),
-    mult_1: float = typer.Option(2.3, help="Maximum oversampling for genotype 1 in mask."),
-    mult_2: float = typer.Option(2.6, help="Maximum oversampling for genotype 2 in mask."),
-    hidden_dim: int = typer.Option(256, help="Hidden layer dimension."),
+    lr: float = typer.Option(1e-3, help="Learning rate."),
+    mult_1: float = typer.Option(2.0, help="Maximum oversampling for genotype 1 in mask."),
+    mult_2: float = typer.Option(2.2, help="Maximum oversampling for genotype 2 in mask."),
+    hidden_dim: int = typer.Option(1024, help="Hidden layer dimension."),
     bottleneck_dim: int = typer.Option(64, help="Bottleneck dimension."),
     gpu: bool = typer.Option(True, help="Whether to use GPU (default True). If False, forces CPU training."),
     gamma: float = typer.Option(2.0, help="Gamma for focal loss"),
     activation: str = typer.Option("relu", help="Activation function"),
     val_split: float = typer.Option(0.2, help="Validation split"),
     results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
-    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    l2_factor: float = typer.Option(0.0, help="L2 regularization factor"),
     loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
-    pool_type: str = typer.Option("attention", help="How to perform pooling: 'flatten', 'average', or 'attention'"),
+    pool_type: str = typer.Option("average", help="How to perform pooling: 'flatten', 'average', or 'attention'"),
     export_model_name: str = typer.Option("DenseEmbAE", help="Model name for saving in output csv results.")
 ):
     # =======================
@@ -437,19 +479,19 @@ def train_and_eval(
     epochs: int = typer.Option(1000),
     batch_size: int = typer.Option(16),
     weight: float = typer.Option(0.0),
-    lr: float = typer.Option(1e-4),
-    mult_1: float = typer.Option(2.3),
-    mult_2: float = typer.Option(2.6),
-    hidden_dim: int = typer.Option(256),
+    lr: float = typer.Option(1e-3),
+    mult_1: float = typer.Option(2.0),
+    mult_2: float = typer.Option(2.2),
+    hidden_dim: int = typer.Option(1024),
     bottleneck_dim: int = typer.Option(64),
     gpu: bool = typer.Option(True),
     gamma: float = typer.Option(2.0),
     val_split: float = typer.Option(0.2),
     activation: str = typer.Option("relu", help="Activation function"),
     results_dir: str = typer.Option(None, help="Folder to save result to if different than results/."),
-    l2_factor: float = typer.Option(1e-4, help="L2 regularization factor"),
+    l2_factor: float = typer.Option(0.0, help="L2 regularization factor"),
     loss: str = typer.Option("ce", help="Loss function (ce or focal)"),
-    pool_type: str = typer.Option("attention", help="How to perform pooling: 'flatten', 'average', or 'attention'"),
+    pool_type: str = typer.Option("average", help="How to perform pooling: 'flatten', 'average', or 'attention'"),
     export_model_name: str = typer.Option("DenseEmbAE", help="Model name for saving in output csv results."),
 ):
     run_dir = train(
