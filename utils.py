@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from typing import Tuple, Optional
+import itertools
 
 # ------------------------
 # Reading files
@@ -27,11 +28,26 @@ def read_maf(maf_path: str) -> Optional[np.ndarray]:
         return None
 
     try:
-        dataMAF = pd.read_csv(p, header=None)
-        dataMAF = dataMAF.drop(dataMAF.columns[-1], axis=1)
-        dataMAF = dataMAF.values.astype(np.float64)
+        if p.suffix == ".csv":
+            # assume CSV already contains [freq_major, freq_minor]
+            dataMAF = pd.read_csv(p, header=None)
+            dataMAF = dataMAF.drop(dataMAF.columns[-1], axis=1)
+            dataMAF = dataMAF.values.astype(np.float64)
+
+        elif p.suffix == ".afreq":
+            # PLINK .afreq: whitespace-separated, columns = #CHROM	ID	REF	ALT	PROVISIONAL_REF?	ALT_FREQS	OBS_CT
+            data = pd.read_csv(p, header=0, delim_whitespace=True)  # has column names
+            # compute freq_major and freq_minor
+            alt_freq = data['ALT_FREQS'].values.astype(np.float64) 
+            freq_minor = alt_freq
+            freq_major = 1.0 - alt_freq
+            dataMAF = np.column_stack((freq_major, freq_minor))
+        else:
+            raise ValueError(f"Unsupported file type: {p.suffix}")
+
         print(f"[INFO] Loaded MAF '{maf_path}' shape {dataMAF.shape}")
         return dataMAF
+    
     except Exception as e:
         print(f"[ERROR] Failed to read MAF: {e}")
         return None
@@ -292,7 +308,7 @@ def create_train_val_datasets(
 # ------------------------
 # Other
 # ------------------------
-def compute_masked_maf(self, dataMAF, mask_miss, maf_threshold=0.05):
+def compute_masked_maf(dataMAF, mask_miss, maf_threshold=0.05):
     """
     rare variant flags of missing SNPs.
     dataMAF[i] = [freq_major, freq_minor] for SNP i.
@@ -301,7 +317,6 @@ def compute_masked_maf(self, dataMAF, mask_miss, maf_threshold=0.05):
     """
     mask_miss = tf.convert_to_tensor(mask_miss, dtype=tf.float32)
     mask_flat = tf.reshape(mask_miss[0], [-1])  # shape (1, n_snps)
-
 
     p = np.sum(dataMAF * mask_flat.numpy()[:, None], axis=1)
     p_min = np.min(dataMAF, axis=1)
@@ -312,13 +327,30 @@ def compute_masked_maf(self, dataMAF, mask_miss, maf_threshold=0.05):
     mafMISS = np.column_stack((p_min_valid, is_rare))
     return mafMISS
 
-def maf_stratified_metrics(self, trueMISS, discrete_predict, dataMAF, mask_missing):
+def maf_stratified_metrics(trueMISS, discrete_predict, dataMAF, mask_missing, maf_threshold=0.05):
         """
         Compute genotype performance stratified by MAF threshold
         """
+        if isinstance(mask_missing, list): # if pytorch BERT output
+            mask_miss = list(itertools.chain.from_iterable(mask_missing)) # unlist batches
+            # remove [CLS] and [SEP]
+            mask_miss = np.array(mask_miss)
+            mask_miss = mask_miss[:, 1:-1]
+            trueMISS = np.array(trueMISS)
+            dataMAF = np.array(dataMAF)
+            discrete_predict = np.array(discrete_predict)
+
+
         # --- Step 1. Compute SNP rarity flags (0 = common, 1 = rare)
-        maf_groups = compute_masked_maf(dataMAF, mask_missing, maf_threshold=self.MAF_threshold)
+        maf_groups = compute_masked_maf(dataMAF, mask_miss, maf_threshold)
         rare_flags = maf_groups[:, 1]
+
+        # print(f"Shape of trueMISS: {trueMISS.shape}")
+        # print(f"Shape of discrete_predict: {discrete_predict.shape}")
+        # print(f"Shape of dataMAF: {dataMAF.shape}")
+        # print(f"Shape of mask_missing: {mask_miss.shape}")
+        # print(f"Shape of maf_groups: {maf_groups.shape}")
+        # print(f"Shape of rare_flags: {rare_flags.shape}")
         
         # --- Step 2. Expand rarity flags to match flattened genotype data
         n_individuals = len(trueMISS) // len(rare_flags)
@@ -334,6 +366,7 @@ def maf_stratified_metrics(self, trueMISS, discrete_predict, dataMAF, mask_missi
 
             f1_micro = f1_score(t, p, average='micro')
             f1_macro = f1_score(t, p, average='macro')
+            f1_per_class = f1_score(t, p, labels=[0, 1, 2], average=None)
             report = classification_report(t, p, digits=3, output_dict=False, zero_division=0)
             cm = confusion_matrix(t, p)
 
@@ -342,6 +375,7 @@ def maf_stratified_metrics(self, trueMISS, discrete_predict, dataMAF, mask_missi
                 "report": report,
                 "f1_micro": f1_micro,
                 "f1_macro": f1_macro,
+                "f1_per_class": f1_per_class,
                 "confusion_matrix": cm
             }
 
